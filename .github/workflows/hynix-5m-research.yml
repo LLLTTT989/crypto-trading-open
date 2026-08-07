@@ -1,0 +1,61 @@
+name: Hynix full 5m research
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'hynix_research/**'
+      - '.github/workflows/hynix-5m-research.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Reconstruct analysis script
+        shell: bash
+        run: |
+          mkdir -p hynix_research/runtime
+          cat hynix_research/chunks/part_*.b64 | base64 --decode | gzip -dc > hynix_research/runtime/hynix_full_research.py
+          python -m py_compile hynix_research/runtime/hynix_full_research.py
+          sha256sum hynix_research/runtime/hynix_full_research.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests numpy pandas scipy statsmodels matplotlib pyarrow
+
+      - name: Fetch all common 5m history and run research
+        env:
+          MPLBACKEND: Agg
+        run: |
+          python hynix_research/runtime/hynix_full_research.py --output-dir output/hynix_5m_report
+
+      - name: Package outputs
+        run: |
+          cd output
+          zip -r hynix_binance_full_5m_report.zip hynix_5m_report
+          sha256sum hynix_binance_full_5m_report.zip > hynix_binance_full_5m_report.zip.sha256
+
+      - name: Upload research artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hynix-binance-full-5m-report
+          path: |
+            output/hynix_binance_full_5m_report.zip
+            output/hynix_binance_full_5m_report.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
