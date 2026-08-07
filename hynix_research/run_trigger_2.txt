@@ -1,0 +1,2 @@
+triggered_at_utc=2026-08-07T09:06:00Z
+transfer_sha256=074d88a3778e42f6b7c613ffe8ede6af3ad44beb234a27a361ece51cf8a253ad
