@@ -1,0 +1,2 @@
+triggered_at_utc=2026-08-07T09:00:00Z
+purpose=binance_public_market_data_full_5m_research
