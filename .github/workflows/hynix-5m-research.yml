@@ -5,7 +5,8 @@ on:
     branches:
       - main
     paths:
-      - 'hynix_research/**'
+      - 'hynix_research/compact/**'
+      - 'hynix_research/run_trigger_compact.txt'
       - '.github/workflows/hynix-5m-research.yml'
 
 permissions:
@@ -25,28 +26,28 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Reconstruct and verify Data Vision analysis script
+      - name: Reconstruct and verify analysis program
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p hynix_research/runtime
-          cat hynix_research/archive/part_*.b64 | tr -d '\n\r ' | base64 --decode > /tmp/hynix_full_research.py.gz
-          echo 'dcbfdd3647237c1cb0e0d315be7b48f1fca6e7ea6dda8ec9eaf75e4a31420581  /tmp/hynix_full_research.py.gz' | sha256sum -c -
-          gzip -t /tmp/hynix_full_research.py.gz
-          gzip -dc /tmp/hynix_full_research.py.gz > hynix_research/runtime/hynix_full_research.py
-          echo '5b6b5cddea335aae055402dc33deec099c05e799b085d17467f76c6e1fb99224  hynix_research/runtime/hynix_full_research.py' | sha256sum -c -
-          python -m py_compile hynix_research/runtime/hynix_full_research.py
+          cat hynix_research/compact/part_*.b64 | tr -d '\n\r ' | base64 --decode > /tmp/hynix_compact.py.gz
+          echo '7c3ac3eee20b902d39bc46a2c75a8f261cb35b31bf88c43b1df8346b1d3af92b  /tmp/hynix_compact.py.gz' | sha256sum -c -
+          gzip -t /tmp/hynix_compact.py.gz
+          gzip -dc /tmp/hynix_compact.py.gz > hynix_research/runtime/hynix_compact.py
+          echo '12e454c56ed4c1938a1e3d480aa16f6288b2282e150d20b016e9bf70b93c9a0f  hynix_research/runtime/hynix_compact.py' | sha256sum -c -
+          python -m py_compile hynix_research/runtime/hynix_compact.py
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install requests numpy pandas scipy statsmodels matplotlib pyarrow
+          python -m pip install requests numpy pandas statsmodels matplotlib
 
-      - name: Fetch official archives and run full research
+      - name: Download official archives and run full backtest
         env:
           MPLBACKEND: Agg
         run: |
-          python hynix_research/runtime/hynix_full_research.py --output-dir output/hynix_5m_report
+          python hynix_research/runtime/hynix_compact.py --output-dir output/hynix_5m_report
 
       - name: Package outputs
         run: |
