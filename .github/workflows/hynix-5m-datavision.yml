@@ -1,0 +1,51 @@
+name: Hynix 5m Data Vision Research
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'hynix_research/**'
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Rebuild analysis script
+        run: |
+          base64 -d hynix_research/v3_script.b64 | gzip -d > hynix_research/hynix_research_v3.py
+          python -m py_compile hynix_research/hynix_research_v3.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests numpy pandas matplotlib statsmodels
+
+      - name: Download official archives, analyze, and backtest
+        env:
+          MPLBACKEND: Agg
+        run: python hynix_research/hynix_research_v3.py --output-dir hynix_5m_report
+
+      - name: Package report
+        run: zip -r hynix_5m_report.zip hynix_5m_report
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hynix-5m-datavision-report
+          path: |
+            hynix_5m_report.zip
+            hynix_5m_report/
+          retention-days: 7
+          if-no-files-found: error
