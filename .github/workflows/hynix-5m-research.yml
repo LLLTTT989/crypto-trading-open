@@ -1,13 +1,10 @@
-name: Hynix full 5m research
+name: Hynix 5m Research
 
 on:
   pull_request:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - 'hynix_research/compact/**'
-      - 'hynix_research/run_trigger_compact.txt'
-      - '.github/workflows/hynix-5m-research.yml'
+      - 'hynix_research/**'
 
 permissions:
   contents: read
@@ -23,44 +20,32 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          cache: 'pip'
+          python-version: '3.11'
 
-      - name: Reconstruct and verify analysis program
-        shell: bash
+      - name: Rebuild analysis script
         run: |
-          set -euo pipefail
-          mkdir -p hynix_research/runtime
-          cat hynix_research/compact/part_*.b64 | tr -d '\n\r ' | base64 --decode > /tmp/hynix_compact.py.gz
-          echo '7c3ac3eee20b902d39bc46a2c75a8f261cb35b31bf88c43b1df8346b1d3af92b  /tmp/hynix_compact.py.gz' | sha256sum -c -
-          gzip -t /tmp/hynix_compact.py.gz
-          gzip -dc /tmp/hynix_compact.py.gz > hynix_research/runtime/hynix_compact.py
-          echo '12e454c56ed4c1938a1e3d480aa16f6288b2282e150d20b016e9bf70b93c9a0f  hynix_research/runtime/hynix_compact.py' | sha256sum -c -
-          python -m py_compile hynix_research/runtime/hynix_compact.py
+          cat hynix_research/v2_chunks/part_*.b64 | base64 -d | gzip -d > hynix_research/hynix_research_v2.py
+          python -m py_compile hynix_research/hynix_research_v2.py
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install requests numpy pandas statsmodels matplotlib
+          python -m pip install requests numpy pandas matplotlib statsmodels
 
-      - name: Download official archives and run full backtest
+      - name: Download, analyze, and backtest
         env:
           MPLBACKEND: Agg
-        run: |
-          python hynix_research/runtime/hynix_compact.py --output-dir output/hynix_5m_report
+        run: python hynix_research/hynix_research_v2.py --output-dir hynix_5m_report
 
-      - name: Package outputs
-        run: |
-          cd output
-          zip -r hynix_binance_full_5m_report.zip hynix_5m_report
-          sha256sum hynix_binance_full_5m_report.zip > hynix_binance_full_5m_report.zip.sha256
+      - name: Package report
+        run: zip -r hynix_5m_report.zip hynix_5m_report
 
-      - name: Upload research artifact
+      - name: Upload report artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hynix-binance-full-5m-report
+          name: hynix-5m-report
           path: |
-            output/hynix_binance_full_5m_report.zip
-            output/hynix_binance_full_5m_report.zip.sha256
-          if-no-files-found: error
+            hynix_5m_report.zip
+            hynix_5m_report/
           retention-days: 7
+          if-no-files-found: error
