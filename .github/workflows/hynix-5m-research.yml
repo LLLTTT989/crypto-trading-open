@@ -22,20 +22,18 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Rebuild analysis script
-        run: |
-          cat hynix_research/v2_chunks/part_*.b64 | base64 -d | gzip -d > hynix_research/hynix_research_v2.py
-          python -m py_compile hynix_research/hynix_research_v2.py
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install requests numpy pandas matplotlib statsmodels
 
-      - name: Download, analyze, and backtest
+      - name: Verify analysis script
+        run: python -m py_compile hynix_research/datavision_full_report.py
+
+      - name: Download official archives, analyze, and backtest
         env:
           MPLBACKEND: Agg
-        run: python hynix_research/hynix_research_v2.py --output-dir hynix_5m_report
+        run: python hynix_research/datavision_full_report.py --end-date 2026-08-06 --output-dir hynix_5m_report
 
       - name: Package report
         run: zip -r hynix_5m_report.zip hynix_5m_report
