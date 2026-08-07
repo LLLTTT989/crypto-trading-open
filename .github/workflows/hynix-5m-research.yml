@@ -14,7 +14,7 @@ permissions:
 jobs:
   research:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,16 +25,16 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Reconstruct and verify analysis script
+      - name: Reconstruct and verify Data Vision analysis script
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p hynix_research/runtime
-          cat hynix_research/correct/part_*.b64 | tr -d '\n\r ' | base64 --decode > /tmp/hynix_full_research.py.gz
-          echo '73155348d843d44cfd373c86d21e37d7310275ec5ec7bd5ba198301257220cee  /tmp/hynix_full_research.py.gz' | sha256sum -c -
+          cat hynix_research/archive/part_*.b64 | tr -d '\n\r ' | base64 --decode > /tmp/hynix_full_research.py.gz
+          echo 'dcbfdd3647237c1cb0e0d315be7b48f1fca6e7ea6dda8ec9eaf75e4a31420581  /tmp/hynix_full_research.py.gz' | sha256sum -c -
           gzip -t /tmp/hynix_full_research.py.gz
           gzip -dc /tmp/hynix_full_research.py.gz > hynix_research/runtime/hynix_full_research.py
-          echo '074d88a3778e42f6b7c613ffe8ede6af3ad44beb234a27a361ece51cf8a253ad  hynix_research/runtime/hynix_full_research.py' | sha256sum -c -
+          echo '5b6b5cddea335aae055402dc33deec099c05e799b085d17467f76c6e1fb99224  hynix_research/runtime/hynix_full_research.py' | sha256sum -c -
           python -m py_compile hynix_research/runtime/hynix_full_research.py
 
       - name: Install dependencies
@@ -42,7 +42,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests numpy pandas scipy statsmodels matplotlib pyarrow
 
-      - name: Fetch all common 5m history and run research
+      - name: Fetch official archives and run full research
         env:
           MPLBACKEND: Agg
         run: |
