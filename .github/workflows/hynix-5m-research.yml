@@ -25,13 +25,17 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Reconstruct analysis script
+      - name: Reconstruct and verify analysis script
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p hynix_research/runtime
-          cat hynix_research/chunks/part_*.b64 | base64 --decode | gzip -dc > hynix_research/runtime/hynix_full_research.py
+          cat hynix_research/correct/part_*.b64 | tr -d '\n\r ' | base64 --decode > /tmp/hynix_full_research.py.gz
+          echo '73155348d843d44cfd373c86d21e37d7310275ec5ec7bd5ba198301257220cee  /tmp/hynix_full_research.py.gz' | sha256sum -c -
+          gzip -t /tmp/hynix_full_research.py.gz
+          gzip -dc /tmp/hynix_full_research.py.gz > hynix_research/runtime/hynix_full_research.py
+          echo '074d88a3778e42f6b7c613ffe8ede6af3ad44beb234a27a361ece51cf8a253ad  hynix_research/runtime/hynix_full_research.py' | sha256sum -c -
           python -m py_compile hynix_research/runtime/hynix_full_research.py
-          sha256sum hynix_research/runtime/hynix_full_research.py
 
       - name: Install dependencies
         run: |
