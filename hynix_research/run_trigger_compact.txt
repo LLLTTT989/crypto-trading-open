@@ -1,0 +1,5 @@
+triggered_at_utc=2026-08-07T09:30:00Z
+source=binance_data_vision
+interval=5m
+symbols=SKHYUSDT,SKHYNIXUSDT
+source_sha256=12e454c56ed4c1938a1e3d480aa16f6288b2282e150d20b016e9bf70b93c9a0f
