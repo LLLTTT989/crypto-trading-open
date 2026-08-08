@@ -13,18 +13,97 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch tweet images
+      - name: Inspect cited Ethereum blocks
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p tweet-media
-          curl -fL --retry 2 'https://pbs.twimg.com/media/HPK9RtBaYAEqtjI.jpg?name=orig' -o tweet-media/image-1.jpg
-          curl -fL --retry 2 'https://pbs.twimg.com/media/HPK9TQjaQAAjEJY.jpg?name=orig' -o tweet-media/image-2.jpg
-          file tweet-media/*
-          ls -lh tweet-media
-      - name: Upload tweet images
-        uses: actions/upload-artifact@v4
-        with:
-          name: tweet-media-2085938658897781117
-          path: tweet-media/
-          retention-days: 1
+          python3 - <<'PY'
+          import json, urllib.request
+
+          RPCS = [
+              "https://ethereum-rpc.publicnode.com",
+              "https://eth.llamarpc.com",
+              "https://1rpc.io/eth",
+          ]
+          BLOCKS = [25707483, 25707488, 25707491]
+          TARGET = "0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950"
+          TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+          def rpc(method, params):
+              last = None
+              for url in RPCS:
+                  try:
+                      data = json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+                      req = urllib.request.Request(url, data=data, headers={"Content-Type":"application/json","User-Agent":"Mozilla/5.0"})
+                      with urllib.request.urlopen(req, timeout=45) as res:
+                          body = json.loads(res.read())
+                      if body.get("error"):
+                          raise RuntimeError(body["error"])
+                      return body["result"]
+                  except Exception as exc:
+                      last = exc
+              raise RuntimeError(f"{method} failed: {last}")
+
+          def addr(topic):
+              return "0x" + topic[-40:].lower()
+
+          def call(to, data):
+              return rpc("eth_call", [{"to":to,"data":data}, "latest"])
+
+          meta = {}
+          def token_meta(token):
+              token = token.lower()
+              if token in meta: return meta[token]
+              symbol, decimals = token[:10], 18
+              try:
+                  raw = bytes.fromhex(call(token, "0x95d89b41")[2:])
+                  if len(raw) >= 64:
+                      off = int.from_bytes(raw[:32], "big")
+                      n = int.from_bytes(raw[off:off+32], "big")
+                      symbol = raw[off+32:off+32+n].decode(errors="replace").strip("\x00")
+                  else:
+                      symbol = raw.rstrip(b"\0").decode(errors="replace")
+              except Exception: pass
+              try: decimals = int(call(token, "0x313ce567"), 16)
+              except Exception: pass
+              meta[token] = (symbol, decimals)
+              return meta[token]
+
+          for block_no in BLOCKS:
+              block = rpc("eth_getBlockByNumber", [hex(block_no), True])
+              print(f"\n===== BLOCK {block_no} time={int(block['timestamp'],16)} txs={len(block['transactions'])} =====")
+              tx_by_hash = {tx["hash"].lower(): tx for tx in block["transactions"]}
+              try:
+                  receipts = rpc("eth_getBlockReceipts", [hex(block_no)])
+              except Exception:
+                  receipts = [rpc("eth_getTransactionReceipt", [tx["hash"]]) for tx in block["transactions"]]
+              for receipt in receipts:
+                  related = []
+                  for log in receipt.get("logs", []):
+                      topics = [x.lower() for x in log.get("topics", [])]
+                      if len(topics) >= 3 and topics[0] == TRANSFER and TARGET in (addr(topics[1]), addr(topics[2])):
+                          related.append(log)
+                  if not related:
+                      continue
+                  txh = receipt["transactionHash"].lower()
+                  tx = tx_by_hash.get(txh) or rpc("eth_getTransactionByHash", [txh])
+                  print("\nTX", txh)
+                  print(" from", tx.get("from"), "to", tx.get("to"), "value", int(tx.get("value","0x0"),16))
+                  print(" input_selector", tx.get("input","")[:10], "gasUsed", int(receipt.get("gasUsed","0x0"),16), "status", int(receipt.get("status","0x0"),16))
+                  print(" related target transfers:")
+                  for log in related:
+                      token = log["address"].lower()
+                      sym, dec = token_meta(token)
+                      src, dst = addr(log["topics"][1]), addr(log["topics"][2])
+                      raw = int(log["data"],16)
+                      print("  ", sym, token, src, "->", dst, "raw", raw, "human", raw/(10**dec))
+                  print(" all ERC20 transfers:")
+                  for log in receipt.get("logs", []):
+                      topics = log.get("topics", [])
+                      if len(topics) < 3 or topics[0].lower() != TRANSFER: continue
+                      token = log["address"].lower()
+                      sym, dec = token_meta(token)
+                      src, dst = addr(topics[1]), addr(topics[2])
+                      raw = int(log["data"],16)
+                      print("  ", sym, token, src, "->", dst, "raw", raw, "human", raw/(10**dec))
+          PY
