@@ -34,8 +34,7 @@ jobs:
                   raise RuntimeError(out['error'])
               return out['result']
           meta = {}
-          def eth_call(to, data):
-              return rpc('eth_call', [{'to':to,'data':data}, 'latest'])
+          def eth_call(to, data): return rpc('eth_call', [{'to':to,'data':data}, 'latest'])
           def decode_symbol(raw):
               try:
                   b=bytes.fromhex(raw[2:])
@@ -57,27 +56,24 @@ jobs:
               meta[addr]={'symbol':sym or addr[:10], 'decimals':dec}
               return meta[addr]
           def topic_addr(t): return '0x'+t[-40:].lower()
-          def h(n): return hex(n)
           for bn in BLOCKS:
-              block=rpc('eth_getBlockByNumber',[h(bn),True])
+              block=rpc('eth_getBlockByNumber',[hex(bn),True])
               print(f'\n######## BLOCK {bn} timestamp={int(block["timestamp"],16)} ########')
               for tx in block['transactions']:
                   receipt=rpc('eth_getTransactionReceipt',[tx['hash']])
-                  transfers=[]
-                  touches=False
+                  transfers=[]; touches=False
                   for log in receipt.get('logs',[]):
-                      topics=log.get('topics',[])
-                      if len(topics)>=3 and topics[0].lower()==TRANSFER:
+                      topics=log.get('topics',[]); data=log.get('data','0x')
+                      if len(topics)==3 and topics[0].lower()==TRANSFER and data not in ('0x','0x0'):
                           frm,to=topic_addr(topics[1]),topic_addr(topics[2])
-                          token=log['address'].lower(); amount=int(log['data'],16)
+                          token=log['address'].lower(); amount=int(data,16)
                           if TARGET in (frm,to): touches=True
                           transfers.append((token,frm,to,amount,log['logIndex']))
                   if not touches and tx.get('from','').lower()!=TARGET and (tx.get('to') or '').lower()!=TARGET:
                       continue
                   print('\nTX',tx['hash'])
                   print(' from',tx.get('from'),'to',tx.get('to'),'selector',tx.get('input','')[:10], 'status',int(receipt['status'],16),'gasUsed',int(receipt['gasUsed'],16))
-                  nets={}
-                  rows=[]
+                  nets={}; rows=[]
                   for token,frm,to,amount,idx in transfers:
                       m=token_meta(token); human=amount/(10**m['decimals'])
                       rows.append({'logIndex':int(idx,16),'token':token,'symbol':m['symbol'],'from':frm,'to':to,'amount_raw':str(amount),'amount':human})
