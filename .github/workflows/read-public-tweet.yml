@@ -1,0 +1,49 @@
+name: Read public tweet
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/read-public-tweet.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch tweet JSON
+        shell: bash
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import json, math, urllib.error, urllib.parse, urllib.request
+
+          tweet_id = "2085938658897781117"
+          handle = "potpotrx"
+          token = "52163ratts"
+          tweet_url = f"https://x.com/{handle}/status/{tweet_id}"
+          urls = [
+              f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token={token}&lang=zh-cn",
+              f"https://api.fxtwitter.com/{handle}/status/{tweet_id}",
+              f"https://api.vxtwitter.com/{handle}/status/{tweet_id}",
+              "https://publish.twitter.com/oembed?" + urllib.parse.urlencode({"url": tweet_url, "omit_script": "true"}),
+              f"https://r.jina.ai/http://x.com/{handle}/status/{tweet_id}",
+          ]
+          for url in urls:
+              print("\n=====", url, "=====", flush=True)
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": "Mozilla/5.0",
+                  "Accept": "application/json,text/plain,text/html,*/*",
+              })
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as res:
+                      body = res.read().decode("utf-8", errors="replace")
+                      print("STATUS", res.status, "TYPE", res.headers.get("content-type"), flush=True)
+                      print(body[:500000], flush=True)
+              except urllib.error.HTTPError as exc:
+                  print("HTTPERROR", exc.code, exc.read().decode("utf-8", errors="replace")[:10000], flush=True)
+              except Exception as exc:
+                  print("ERROR", repr(exc), flush=True)
+          PY
