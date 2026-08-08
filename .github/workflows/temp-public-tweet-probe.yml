@@ -1,0 +1,34 @@
+name: 临时读取公开推文
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-public-tweet-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch public tweet JSON
+        shell: bash
+        run: |
+          set +e
+          for url in \
+            'https://cdn.syndication.twimg.com/tweet-result?id=2085938658897781117&lang=en&token=52163ratts' \
+            'https://api.fxtwitter.com/potpotrx/status/2085938658897781117' \
+            'https://api.vxtwitter.com/potpotrx/status/2085938658897781117' \
+            'https://r.jina.ai/https://x.com/potpotrx/status/2085938658897781117'
+          do
+            echo "===== ${url} ====="
+            curl --location --silent --show-error --max-time 45 \
+              --header 'User-Agent: Mozilla/5.0' \
+              --header 'Accept: application/json,text/plain,text/html,*/*' \
+              "$url"
+            echo
+            echo "===== END ====="
+          done
+          exit 0
