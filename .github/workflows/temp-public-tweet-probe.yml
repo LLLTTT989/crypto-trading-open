@@ -13,22 +13,22 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch public tweet JSON
+      - name: Fetch tweet images
         shell: bash
         run: |
-          set +e
-          for url in \
-            'https://cdn.syndication.twimg.com/tweet-result?id=2085938658897781117&lang=en&token=52163ratts' \
-            'https://api.fxtwitter.com/potpotrx/status/2085938658897781117' \
-            'https://api.vxtwitter.com/potpotrx/status/2085938658897781117' \
-            'https://r.jina.ai/https://x.com/potpotrx/status/2085938658897781117'
-          do
-            echo "===== ${url} ====="
-            curl --location --silent --show-error --max-time 45 \
-              --header 'User-Agent: Mozilla/5.0' \
-              --header 'Accept: application/json,text/plain,text/html,*/*' \
-              "$url"
-            echo
-            echo "===== END ====="
-          done
-          exit 0
+          set -euo pipefail
+          mkdir -p tweet-media
+          curl --location --fail --silent --show-error --max-time 45 \
+            'https://pbs.twimg.com/media/HPK9RtBaYAEqtjI.jpg?name=orig' \
+            --output tweet-media/1.jpg
+          curl --location --fail --silent --show-error --max-time 45 \
+            'https://pbs.twimg.com/media/HPK9TQjaQAAjEJY.jpg?name=orig' \
+            --output tweet-media/2.jpg
+          file tweet-media/*
+      - name: Upload tweet images
+        uses: actions/upload-artifact@v4
+        with:
+          name: tweet-media-2085938658897781117
+          path: tweet-media
+          if-no-files-found: error
+          retention-days: 1
