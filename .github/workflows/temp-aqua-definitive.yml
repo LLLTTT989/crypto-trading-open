@@ -1,0 +1,140 @@
+name: 临时核验 Aqua 自成交
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-definitive.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  decode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decode Aqua and SwapVM events
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'web3>=7,<8'
+          python3 - <<'PY'
+          from web3 import Web3
+          from hexbytes import HexBytes
+          import json
+
+          RPCS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://1rpc.io/eth',
+          ]
+          TXS = [
+              '0xf6c7e430b05ef3a37ad48cd964e41b5f320d5b40e35c8a471654e6a4ca5c8dee',
+              '0x5c03bb9c98ff30bbdfd08c2fa5231b3f747ac1dbfe5e5d71a93e2580caed4da6',
+              '0xfb2c0519bdca5394e06d9b6b802a97930f9151df6b91c5c9977b42f7bdc0149d',
+          ]
+          TARGET = '0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          w3 = None
+          for rpc in RPCS:
+              candidate = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 60}))
+              try:
+                  candidate.eth.block_number
+                  w3 = candidate
+                  print('RPC', rpc)
+                  break
+              except Exception as exc:
+                  print('RPC_FAIL', rpc, repr(exc))
+          if w3 is None:
+              raise SystemExit('no RPC')
+
+          swapped_topic = Web3.keccak(text='Swapped(bytes32,address,address,address,address,uint256,uint256)').hex()
+          pulled_topic = Web3.keccak(text='Pulled(address,address,bytes32,address,uint256)').hex()
+          pushed_topic = Web3.keccak(text='Pushed(address,address,bytes32,address,uint256)').hex()
+          transfer_topic = Web3.keccak(text='Transfer(address,address,uint256)').hex()
+          swap_selector = Web3.keccak(text='swap((address,uint256,bytes),uint256,bytes)')[:4].hex()
+          print('TOPICS', swapped_topic, pulled_topic, pushed_topic, 'SWAP_SELECTOR', swap_selector)
+
+          def addr(v):
+              return Web3.to_checksum_address(v).lower()
+
+          def dec_event(log, types):
+              return w3.codec.decode(types, HexBytes(log['data']))
+
+          def norm(x):
+              if isinstance(x, bytes): return '0x'+x.hex()
+              if isinstance(x, (list, tuple)): return [norm(v) for v in x]
+              return x
+
+          for txh in TXS:
+              print('\n' + '='*110)
+              print('TX', txh)
+              tx = w3.eth.get_transaction(txh)
+              receipt = w3.eth.get_transaction_receipt(txh)
+              print('TOP', {'from': tx['from'], 'to': tx['to'], 'selector': tx['input'][:10], 'block': tx['blockNumber'], 'status': receipt['status']})
+              swaps=[]; aqua=[]
+              for log in receipt['logs']:
+                  t0 = log['topics'][0].hex() if log['topics'] else ''
+                  if t0 == swapped_topic:
+                      vals=dec_event(log,['bytes32','address','address','address','address','uint256','uint256'])
+                      row={
+                          'logIndex':log['logIndex'],'emitter':log['address'].lower(),
+                          'orderHash':'0x'+vals[0].hex(),'maker':vals[1].lower(),'taker':vals[2].lower(),
+                          'tokenIn':vals[3].lower(),'tokenOut':vals[4].lower(),
+                          'amountIn':str(vals[5]),'amountOut':str(vals[6]),
+                          'target':vals[1].lower()==TARGET,
+                          'sameToken':vals[3].lower()==vals[4].lower(),
+                      }
+                      swaps.append(row)
+                  elif t0 in (pulled_topic,pushed_topic):
+                      vals=dec_event(log,['address','address','bytes32','address','uint256'])
+                      row={
+                          'kind':'Pulled' if t0==pulled_topic else 'Pushed',
+                          'logIndex':log['logIndex'],'emitter':log['address'].lower(),
+                          'maker':vals[0].lower(),'app':vals[1].lower(),'strategyHash':'0x'+vals[2].hex(),
+                          'token':vals[3].lower(),'amount':str(vals[4]),
+                          'target':vals[0].lower()==TARGET,
+                      }
+                      aqua.append(row)
+              print('SWAPPED_EVENTS', json.dumps(swaps, indent=2))
+              print('TARGET_AQUA_EVENTS', json.dumps([x for x in aqua if x['target']], indent=2))
+
+              # Best-effort call trace. Extract direct SwapVM.swap calldata so order.maker is independently visible.
+              trace=None
+              for method,params in [
+                  ('debug_traceTransaction',[txh,{'tracer':'callTracer','timeout':'60s'}]),
+                  ('trace_transaction',[txh]),
+              ]:
+                  try:
+                      trace=w3.provider.make_request(method,params)
+                      if not trace.get('error'):
+                          print('TRACE_METHOD',method)
+                          break
+                  except Exception as exc:
+                      print('TRACE_FAIL',method,repr(exc))
+              decoded=[]
+              def walk(node,path='0'):
+                  if not isinstance(node,dict): return
+                  inp=node.get('input') or node.get('action',{}).get('input') or '0x'
+                  to=node.get('to') or node.get('action',{}).get('to')
+                  frm=node.get('from') or node.get('action',{}).get('from')
+                  if isinstance(inp,str) and inp[2:10].lower()==swap_selector.lower():
+                      try:
+                          order, amount, taker_data = w3.codec.decode(['(address,uint256,bytes)','uint256','bytes'],HexBytes('0x'+inp[10:]))
+                          decoded.append({'path':path,'from':frm,'to':to,'maker':order[0].lower(),'traits':str(order[1]),'orderDataLen':len(order[2]),'amount':str(amount),'takerDataLen':len(taker_data),'target':order[0].lower()==TARGET})
+                      except Exception as exc:
+                          decoded.append({'path':path,'from':frm,'to':to,'decodeError':repr(exc),'selector':inp[:10]})
+                  for i,ch in enumerate(node.get('calls') or []): walk(ch,path+'.'+str(i))
+              if trace and not trace.get('error'):
+                  result=trace.get('result')
+                  if isinstance(result,dict): walk(result)
+                  elif isinstance(result,list):
+                      for i,item in enumerate(result):
+                          action=item.get('action',{}) if isinstance(item,dict) else {}
+                          inp=action.get('input','0x')
+                          if isinstance(inp,str) and inp[2:10].lower()==swap_selector.lower():
+                              try:
+                                  order, amount, taker_data=w3.codec.decode(['(address,uint256,bytes)','uint256','bytes'],HexBytes('0x'+inp[10:]))
+                                  decoded.append({'path':str(i),'from':action.get('from'),'to':action.get('to'),'maker':order[0].lower(),'traits':str(order[1]),'orderDataLen':len(order[2]),'amount':str(amount),'takerDataLen':len(taker_data),'target':order[0].lower()==TARGET})
+                              except Exception as exc: decoded.append({'path':str(i),'decodeError':repr(exc)})
+              print('DECODED_SWAP_CALLS',json.dumps(decoded,indent=2))
+          PY
