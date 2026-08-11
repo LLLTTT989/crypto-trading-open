@@ -1,0 +1,140 @@
+name: 临时精简核对 Aqua
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-concise.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print concise verified facts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'web3>=7,<8' requests
+          python3 - <<'PY'
+          from web3 import Web3
+          from hexbytes import HexBytes
+          from decimal import Decimal, getcontext
+          from datetime import datetime, timezone
+          import requests
+          getcontext().prec=80
+
+          TARGET='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          ROUTER='0x111111338c5091e8440b67b168bae16a668ac0de'
+          AQUA='0x1111113ccf1426a8e30e2bff5e005d929bf6a90a'
+          DIST='0x3ef3d8ba38ebe18db133cec108f4d14ce00dd9ae'
+          TOKEN_META={
+            '0x111111111117dc0aa78b770fa6a738034120c302':('1INCH',18),
+            '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48':('USDC',6),
+            '0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0':('wstETH',18),
+            '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':('WETH',18),
+            '0xae7ab96520de3a18e5e111b5eaab095312d7fe84':('stETH',18),
+            '0xbe9895146f7af43049ca1c1ae358b0541ea49704':('cbETH',18),
+          }
+          def human(raw,dec): return Decimal(raw)/(Decimal(10)**dec)
+          def iso(ts): return datetime.fromtimestamp(ts,timezone.utc).isoformat()
+
+          # Merkl authoritative counters.
+          for url in [
+            f'https://api.merkl.xyz/v4/users/{TARGET}/rewards?chainId=1&reloadChainId=1',
+            f'https://api.merkl.xyz/v4/users/{TARGET}/rewards?chainId=1',
+          ]:
+            r=requests.get(url,timeout=60,headers={'user-agent':'Mozilla/5.0','accept':'application/json'})
+            print('MERKL_HTTP',r.status_code,url)
+            if r.ok and isinstance(r.json(),list):
+              merkl=r.json(); break
+          else: raise SystemExit('Merkl unavailable')
+          rewards=[]
+          for chain in merkl:
+            for x in chain.get('rewards',[]):
+              t=x.get('token',{}); d=int(t.get('decimals',18)); s=Decimal(10)**d
+              amount=Decimal(str(x.get('amount') or 0)); claimed=Decimal(str(x.get('claimed') or 0)); pending=Decimal(str(x.get('pending') or 0))
+              row=(str(t.get('symbol')),str(t.get('address','')).lower(),d,amount/s,claimed/s,(amount-claimed)/s,pending/s,(amount+pending)/s,t.get('price'))
+              rewards.append(row)
+              print('REWARD|%s|credited=%s|claimed=%s|claimable=%s|pending=%s|including_pending=%s|price=%s' % (row[0],row[3],row[4],row[5],row[6],row[7],row[8]))
+
+          w3=None
+          for rpc in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
+            try:
+              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':60})); latest=c.eth.block_number; w3=c; print('RPC',rpc,'LATEST',latest); break
+            except Exception as e: print('RPC_FAIL',rpc,repr(e))
+          if w3 is None: raise SystemExit('No RPC')
+          cache={}
+          def stamp(log):
+            b=int(log['blockNumber'])
+            if b not in cache: cache[b]=int(w3.eth.get_block(b)['timestamp'])
+            return cache[b]
+          def logs(address,topics,start,end,chunk=5000):
+            out=[]
+            cur=start
+            while cur<=end:
+              stop=min(end,cur+chunk-1)
+              try: out += list(w3.eth.get_logs({'fromBlock':cur,'toBlock':stop,'address':Web3.to_checksum_address(address),'topics':topics}))
+              except Exception as e:
+                if chunk<=250: print('LOG_SKIP',address,cur,stop,repr(e))
+                else: out += logs(address,topics,cur,stop,max(250,chunk//4))
+              cur=stop+1
+            return out
+
+          SW=Web3.keccak(text='Swapped(bytes32,address,address,address,address,uint256,uint256)').hex()
+          SH=Web3.keccak(text='Shipped(address,address,bytes32,bytes)').hex()
+          DO=Web3.keccak(text='Docked(address,address,bytes32)').hex()
+          TR=Web3.keccak(text='Transfer(address,address,uint256)').hex()
+          recent_start=25700000
+          campaign_start=25600000
+
+          fills=[]
+          for l in logs(ROUTER,[SW],recent_start,latest):
+            v=w3.codec.decode(['bytes32','address','address','address','address','uint256','uint256'],HexBytes(l['data']))
+            if v[1].lower()!=TARGET: continue
+            ti=v[3].lower(); to=v[4].lower(); mi=TOKEN_META.get(ti,(ti[:10],18)); mo=TOKEN_META.get(to,(to[:10],18)); ts=stamp(l)
+            fills.append((ts,l['transactionHash'].hex(),'0x'+v[0].hex(),mi[0],human(v[5],mi[1]),mo[0],human(v[6],mo[1]),v[2].lower()))
+          fills.sort()
+          print('FILL_COUNT',len(fills))
+          agg={}
+          for f in fills:
+            key=(f[2],f[3],f[5]); g=agg.setdefault(key,[0,Decimal(0),Decimal(0),f[0],f[0]]); g[0]+=1; g[1]+=f[4]; g[2]+=f[6]; g[3]=min(g[3],f[0]); g[4]=max(g[4],f[0])
+          for (strategy,a,b),g in sorted(agg.items(),key=lambda x:x[1][4]):
+            print(f'FILL_SUMMARY|{a}->{b}|count={g[0]}|amount_in={g[1]}|amount_out={g[2]}|first={iso(g[3])}|last={iso(g[4])}|strategy={strategy}')
+          for f in fills[-30:]:
+            print(f'FILL|{iso(f[0])}|{f[3]}={f[4]}|{f[5]}={f[6]}|strategy={f[2]}|taker={f[7]}|tx={f[1]}')
+
+          lifecycle=[]
+          for topic,kind,types in [(SH,'SHIP',['address','address','bytes32','bytes']),(DO,'DOCK',['address','address','bytes32'])]:
+            for l in logs(AQUA,[topic],recent_start,latest):
+              v=w3.codec.decode(types,HexBytes(l['data']))
+              if v[0].lower()==TARGET: lifecycle.append((stamp(l),kind,'0x'+v[2].hex(),v[1].lower(),l['transactionHash'].hex()))
+          for x in sorted(lifecycle): print(f'LIFECYCLE|{iso(x[0])}|{x[1]}|strategy={x[2]}|app={x[3]}|tx={x[4]}')
+          print('LIFECYCLE_COUNT',len(lifecycle))
+
+          # Actual Merkl Distributor ERC20 transfers to wallet.
+          dt='0x'+'0'*24+DIST[2:]; tt='0x'+'0'*24+TARGET[2:]
+          claims=[]
+          for sym,token,dec,*_ in rewards:
+            if len(token)!=42: continue
+            for l in logs(token,[TR,dt,tt],campaign_start,latest,10000):
+              raw=int.from_bytes(HexBytes(l['data']),'big'); claims.append((stamp(l),sym,human(raw,dec),l['transactionHash'].hex(),int(l['blockNumber'])))
+          for c in sorted(claims): print(f'CLAIM_TRANSFER|{iso(c[0])}|{c[1]}={c[2]}|block={c[4]}|tx={c[3]}')
+          print('CLAIM_TRANSFER_COUNT',len(claims))
+
+          # Latest direct EOA transactions and token transfers from Blockscout, concise.
+          for kind,url in [
+            ('TX',f'https://eth.blockscout.com/api/v2/addresses/{TARGET}/transactions'),
+            ('TOKEN',f'https://eth.blockscout.com/api/v2/addresses/{TARGET}/token-transfers?type=ERC-20'),
+          ]:
+            try:
+              z=requests.get(url,timeout=60,headers={'user-agent':'Mozilla/5.0','accept':'application/json'}); print('BLOCKSCOUT_HTTP',kind,z.status_code)
+              if not z.ok: continue
+              for item in z.json().get('items',[])[:25]:
+                if kind=='TX': print('DIRECT_TX|timestamp=%s|hash=%s|from=%s|to=%s|method=%s|status=%s' % (item.get('timestamp'),item.get('hash'),(item.get('from') or {}).get('hash'),(item.get('to') or {}).get('hash'),item.get('method'),item.get('status')))
+                else:
+                  token=item.get('token') or {}; val=item.get('total') or item.get('value') or {}; print('TOKEN_MOVE|timestamp=%s|tx=%s|symbol=%s|value=%s|from=%s|to=%s' % (item.get('timestamp'),item.get('transaction_hash'),token.get('symbol'),val,(item.get('from') or {}).get('hash'),(item.get('to') or {}).get('hash')))
+            except Exception as e: print('BLOCKSCOUT_FAIL',kind,repr(e))
+          PY
