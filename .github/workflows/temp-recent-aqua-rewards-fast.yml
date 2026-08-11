@@ -1,0 +1,113 @@
+name: 临时快速核对 Aqua 奖励
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-recent-aqua-rewards-fast.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fast query
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'web3>=7,<8' requests
+          python3 - <<'PY'
+          from web3 import Web3
+          from hexbytes import HexBytes
+          from decimal import Decimal, getcontext
+          from datetime import datetime, timezone
+          import requests, json
+          getcontext().prec=80
+          TARGET='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          ROUTER='0x111111338c5091e8440b67b168bae16a668ac0de'
+          AQUA='0x1111113ccf1426a8e30e2bff5e005d929bf6a90a'
+          DIST='0x3ef3d8ba38ebe18db133cec108f4d14ce00dd9ae'
+          TOKENS={
+            '0x111111111117dc0aa78b770fa6a738034120c302':('1INCH',18),
+            '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48':('USDC',6),
+            '0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0':('wstETH',18),
+            '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':('WETH',18),
+          }
+          def h(raw,dec): return str(Decimal(raw)/(Decimal(10)**dec))
+          def iso(ts): return datetime.fromtimestamp(ts,timezone.utc).isoformat()
+
+          # Merkl authoritative current state.
+          u=f'https://api.merkl.xyz/v4/users/{TARGET}/rewards?chainId=1&reloadChainId=1'
+          rr=requests.get(u,timeout=60,headers={'user-agent':'Mozilla/5.0'}); rr.raise_for_status(); data=rr.json()
+          rewards=[]
+          for row in data:
+            for x in row.get('rewards',[]):
+              t=x.get('token',{}); dec=int(t.get('decimals',18)); scale=Decimal(10)**dec
+              amount=Decimal(str(x.get('amount',0))); claimed=Decimal(str(x.get('claimed',0))); pending=Decimal(str(x.get('pending',0)))
+              rewards.append({'symbol':t.get('symbol'),'address':str(t.get('address','')).lower(),'decimals':dec,'credited':str(amount/scale),'claimed':str(claimed/scale),'claimable':str((amount-claimed)/scale),'pending':str(pending/scale),'total_including_pending':str((amount+pending)/scale),'price':t.get('price'),'breakdowns':x.get('breakdowns',[])})
+
+          w3=None
+          for rpc in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
+            try:
+              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':60})); _=c.eth.block_number; w3=c; rpc_used=rpc; break
+            except Exception as e: print('RPC_FAIL',rpc,repr(e))
+          if w3 is None: raise SystemExit('no rpc')
+          latest=w3.eth.block_number; recent=max(0,latest-30000); campaign=max(0,latest-110000)
+          cache={}
+          def ts(log):
+            b=int(log['blockNumber'])
+            if b not in cache: cache[b]=int(w3.eth.get_block(b)['timestamp'])
+            return cache[b]
+          def logs(addr,topics,start,end,chunk=5000):
+            out=[]
+            for a in range(start,end+1,chunk):
+              b=min(end,a+chunk-1)
+              try: out += list(w3.eth.get_logs({'fromBlock':a,'toBlock':b,'address':Web3.to_checksum_address(addr),'topics':topics}))
+              except Exception as e:
+                print('LOG_FAIL',addr,a,b,repr(e))
+                for aa in range(a,b+1,500):
+                  bb=min(b,aa+499)
+                  try: out += list(w3.eth.get_logs({'fromBlock':aa,'toBlock':bb,'address':Web3.to_checksum_address(addr),'topics':topics}))
+                  except Exception as ee: print('LOG_FAIL_SMALL',aa,bb,repr(ee))
+            return out
+          SW=Web3.keccak(text='Swapped(bytes32,address,address,address,address,uint256,uint256)').hex()
+          SH=Web3.keccak(text='Shipped(address,address,bytes32,bytes)').hex()
+          DO=Web3.keccak(text='Docked(address,address,bytes32)').hex()
+          TR=Web3.keccak(text='Transfer(address,address,uint256)').hex()
+          fills=[]
+          for l in logs(ROUTER,[SW],recent,latest):
+            v=w3.codec.decode(['bytes32','address','address','address','address','uint256','uint256'],HexBytes(l['data']))
+            if v[1].lower()!=TARGET: continue
+            ti=v[3].lower(); to=v[4].lower(); mi=TOKENS.get(ti,(ti[:10],18)); mo=TOKENS.get(to,(to[:10],18)); stamp=ts(l)
+            fills.append({'tx':l['transactionHash'].hex(),'block':int(l['blockNumber']),'utc':iso(stamp),'strategy':'0x'+v[0].hex(),'taker':v[2].lower(),'token_in':mi[0],'amount_in':h(v[5],mi[1]),'token_out':mo[0],'amount_out':h(v[6],mo[1])})
+          lifecycle=[]
+          for topic,kind,types in [(SH,'Shipped',['address','address','bytes32','bytes']),(DO,'Docked',['address','address','bytes32'])]:
+            for l in logs(AQUA,[topic],recent,latest):
+              v=w3.codec.decode(types,HexBytes(l['data']))
+              if v[0].lower()!=TARGET: continue
+              lifecycle.append({'kind':kind,'tx':l['transactionHash'].hex(),'block':int(l['blockNumber']),'utc':iso(ts(l)),'app':v[1].lower(),'strategy':'0x'+v[2].hex()})
+          claims=[]
+          dt='0x'+'0'*24+DIST[2:]; tt='0x'+'0'*24+TARGET[2:]
+          reward_token_map={x['address']:(x['symbol'],x['decimals']) for x in rewards if x.get('address')}
+          for token,(sym,dec) in reward_token_map.items():
+            for l in logs(token,[TR,dt,tt],campaign,latest,10000):
+              raw=int.from_bytes(HexBytes(l['data']),'big')
+              claims.append({'tx':l['transactionHash'].hex(),'block':int(l['blockNumber']),'utc':iso(ts(l)),'symbol':sym,'amount':h(raw,dec)})
+
+          # Blockscout recent direct EOA transactions.
+          direct=[]; token_moves=[]
+          for name,url in {
+            'direct':f'https://eth.blockscout.com/api/v2/addresses/{TARGET}/transactions?filter=to%20%7C%20from',
+            'token':f'https://eth.blockscout.com/api/v2/addresses/{TARGET}/token-transfers?type=ERC-20',
+          }.items():
+            try:
+              z=requests.get(url,timeout=60,headers={'user-agent':'Mozilla/5.0'}); z.raise_for_status(); items=z.json().get('items',[])
+              (direct if name=='direct' else token_moves).extend(items[:50])
+            except Exception as e: print('BLOCKSCOUT_FAIL',name,repr(e))
+          out={'generated_at':datetime.now(timezone.utc).isoformat(),'rpc':rpc_used,'latest_block':latest,'rewards':rewards,'claims_from_distributor':sorted(claims,key=lambda x:x['block']),'recent_fills':sorted(fills,key=lambda x:x['block']),'recent_lifecycle':sorted(lifecycle,key=lambda x:x['block']),'blockscout_direct':direct,'blockscout_token_moves':token_moves}
+          print('FAST_RESULT_BEGIN')
+          print(json.dumps(out,ensure_ascii=False,indent=2,default=str))
+          print('FAST_RESULT_END')
+          PY
