@@ -1,0 +1,322 @@
+name: 临时核对 Aqua 最近动作与奖励
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-recent-aqua-rewards.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query Merkl and Ethereum
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'web3>=7,<8' requests
+          mkdir -p result
+          python3 - <<'PY'
+          from web3 import Web3
+          from hexbytes import HexBytes
+          from decimal import Decimal, getcontext
+          from datetime import datetime, timezone
+          import requests, json, time, os
+
+          getcontext().prec = 80
+
+          TARGET = '0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          AQUA = '0x1111113ccf1426a8e30e2bff5e005d929bf6a90a'
+          ROUTER = '0x111111338c5091e8440b67b168bae16a668ac0de'
+          DISTRIBUTOR = '0x3ef3d8ba38ebe18db133cec108f4d14ce00dd9ae'
+          RPCS = [
+              'https://ethereum-rpc.publicnode.com',
+              'https://eth.llamarpc.com',
+              'https://1rpc.io/eth',
+          ]
+          RECENT_START_TS = int(datetime(2026, 8, 8, 0, 0, tzinfo=timezone.utc).timestamp())
+          CAMPAIGN_START_TS = int(datetime(2026, 7, 28, 0, 0, tzinfo=timezone.utc).timestamp())
+
+          def dump(path, value):
+              with open(path, 'w', encoding='utf-8') as f:
+                  json.dump(value, f, ensure_ascii=False, indent=2, default=str)
+
+          # 1) Merkl current rewards, cache-forced.
+          merkl_url = f'https://api.merkl.xyz/v4/users/{TARGET}/rewards?chainId=1&reloadChainId=1'
+          r = requests.get(merkl_url, timeout=60, headers={'user-agent':'Mozilla/5.0'})
+          print('MERKL_HTTP', r.status_code, r.url)
+          r.raise_for_status()
+          merkl = r.json()
+          dump('result/merkl_raw.json', merkl)
+
+          reward_summary = []
+          reward_tokens = {}
+          for chain_row in merkl if isinstance(merkl, list) else []:
+              chain = chain_row.get('chain') or {}
+              for reward in chain_row.get('rewards') or []:
+                  token = reward.get('token') or {}
+                  dec = int(token.get('decimals') or 18)
+                  scale = Decimal(10) ** dec
+                  amount_raw = Decimal(str(reward.get('amount') or '0'))
+                  claimed_raw = Decimal(str(reward.get('claimed') or '0'))
+                  pending_raw = Decimal(str(reward.get('pending') or '0'))
+                  address = str(token.get('address') or '').lower()
+                  symbol = token.get('symbol') or address
+                  reward_tokens[address] = {'symbol':symbol,'decimals':dec}
+                  row = {
+                      'chain_id': chain.get('id'),
+                      'chain_name': chain.get('name'),
+                      'token_address': address,
+                      'symbol': symbol,
+                      'decimals': dec,
+                      'amount_raw': str(amount_raw),
+                      'claimed_raw': str(claimed_raw),
+                      'pending_raw': str(pending_raw),
+                      'credited': str(amount_raw / scale),
+                      'claimed': str(claimed_raw / scale),
+                      'claimable': str((amount_raw - claimed_raw) / scale),
+                      'pending': str(pending_raw / scale),
+                      'earned_including_pending': str((amount_raw + pending_raw) / scale),
+                      'token_price': token.get('price'),
+                      'breakdowns': reward.get('breakdowns') or [],
+                  }
+                  reward_summary.append(row)
+
+          # 2) Ethereum RPC.
+          w3 = None
+          rpc_used = None
+          for rpc in RPCS:
+              try:
+                  candidate = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout':60}))
+                  _ = candidate.eth.block_number
+                  w3 = candidate
+                  rpc_used = rpc
+                  break
+              except Exception as exc:
+                  print('RPC_FAIL', rpc, repr(exc))
+          if w3 is None:
+              raise SystemExit('No working Ethereum RPC')
+          print('RPC_USED', rpc_used)
+          latest = w3.eth.block_number
+
+          def block_ts(block):
+              return int(w3.eth.get_block(block)['timestamp'])
+
+          def block_at_or_after(ts):
+              lo, hi = max(0, latest - 250_000), latest
+              while lo < hi:
+                  mid = (lo + hi) // 2
+                  if block_ts(mid) < ts:
+                      lo = mid + 1
+                  else:
+                      hi = mid
+              return lo
+
+          recent_block = block_at_or_after(RECENT_START_TS)
+          campaign_block = block_at_or_after(CAMPAIGN_START_TS)
+          print('BLOCK_RANGE', {'campaign':campaign_block,'recent':recent_block,'latest':latest})
+
+          def get_logs(address, topics, start, end, chunk=1500):
+              out=[]
+              cur=start
+              while cur <= end:
+                  stop=min(end,cur+chunk-1)
+                  try:
+                      out.extend(w3.eth.get_logs({'fromBlock':cur,'toBlock':stop,'address':Web3.to_checksum_address(address),'topics':topics}))
+                      cur=stop+1
+                  except Exception as exc:
+                      if chunk <= 50:
+                          print('GET_LOGS_FAIL',address,cur,stop,repr(exc))
+                          cur=stop+1
+                      else:
+                          # retry current interval at a smaller chunk size
+                          smaller=max(50,chunk//2)
+                          out.extend(get_logs(address, topics, cur, stop, smaller))
+                          cur=stop+1
+              return out
+
+          SWAPPED = Web3.keccak(text='Swapped(bytes32,address,address,address,address,uint256,uint256)').hex()
+          SHIPPED = Web3.keccak(text='Shipped(address,address,bytes32,bytes)').hex()
+          DOCKED = Web3.keccak(text='Docked(address,address,bytes32)').hex()
+          PULLED = Web3.keccak(text='Pulled(address,address,bytes32,address,uint256)').hex()
+          PUSHED = Web3.keccak(text='Pushed(address,address,bytes32,address,uint256)').hex()
+          TRANSFER = Web3.keccak(text='Transfer(address,address,uint256)').hex()
+
+          ts_cache={}
+          def timestamp_for(log):
+              bn=int(log['blockNumber'])
+              if bn not in ts_cache:
+                  ts_cache[bn]=block_ts(bn)
+              return ts_cache[bn]
+
+          token_meta_cache = {
+              '0x111111111117dc0aa78b770fa6a738034120c302': {'symbol':'1INCH','decimals':18},
+              '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': {'symbol':'USDC','decimals':6},
+              '0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0': {'symbol':'wstETH','decimals':18},
+              '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2': {'symbol':'WETH','decimals':18},
+          }
+          erc20_abi=[
+              {'constant':True,'inputs':[],'name':'symbol','outputs':[{'name':'','type':'string'}],'type':'function'},
+              {'constant':True,'inputs':[],'name':'decimals','outputs':[{'name':'','type':'uint8'}],'type':'function'},
+          ]
+          def token_meta(address):
+              address=address.lower()
+              if address in token_meta_cache:
+                  return token_meta_cache[address]
+              symbol=address[:10]; decimals=18
+              try:
+                  c=w3.eth.contract(address=Web3.to_checksum_address(address),abi=erc20_abi)
+                  symbol=c.functions.symbol().call()
+                  decimals=int(c.functions.decimals().call())
+              except Exception:
+                  pass
+              token_meta_cache[address]={'symbol':symbol,'decimals':decimals}
+              return token_meta_cache[address]
+
+          def human(raw, decimals):
+              return str(Decimal(raw)/(Decimal(10)**decimals))
+
+          # 3) Recent Aqua fills.
+          fills=[]
+          for log in get_logs(ROUTER,[SWAPPED],recent_block,latest):
+              try:
+                  vals=w3.codec.decode(['bytes32','address','address','address','address','uint256','uint256'],HexBytes(log['data']))
+                  maker=vals[1].lower()
+                  if maker != TARGET: continue
+                  token_in=vals[3].lower(); token_out=vals[4].lower()
+                  mi=token_meta(token_in); mo=token_meta(token_out)
+                  ts=timestamp_for(log)
+                  fills.append({
+                      'tx_hash':log['transactionHash'].hex(),
+                      'block':int(log['blockNumber']),
+                      'timestamp':ts,
+                      'utc':datetime.fromtimestamp(ts,timezone.utc).isoformat(),
+                      'strategy_hash':'0x'+vals[0].hex(),
+                      'maker':maker,
+                      'taker':vals[2].lower(),
+                      'token_in':token_in,'token_in_symbol':mi['symbol'],
+                      'amount_in_raw':str(vals[5]),'amount_in':human(vals[5],mi['decimals']),
+                      'token_out':token_out,'token_out_symbol':mo['symbol'],
+                      'amount_out_raw':str(vals[6]),'amount_out':human(vals[6],mo['decimals']),
+                  })
+              except Exception as exc:
+                  print('SWAPPED_DECODE_FAIL',log['transactionHash'].hex(),repr(exc))
+          fills.sort(key=lambda x:(x['block'],x['tx_hash']))
+
+          # 4) Strategy lifecycle and Aqua accounting events.
+          lifecycle=[]
+          for topic,kind,types in [
+              (SHIPPED,'Shipped',['address','address','bytes32','bytes']),
+              (DOCKED,'Docked',['address','address','bytes32']),
+          ]:
+              for log in get_logs(AQUA,[topic],campaign_block,latest):
+                  try:
+                      vals=w3.codec.decode(types,HexBytes(log['data']))
+                      if vals[0].lower()!=TARGET: continue
+                      ts=timestamp_for(log)
+                      row={'kind':kind,'tx_hash':log['transactionHash'].hex(),'block':int(log['blockNumber']),'timestamp':ts,'utc':datetime.fromtimestamp(ts,timezone.utc).isoformat(),'maker':vals[0].lower(),'app':vals[1].lower(),'strategy_hash':'0x'+vals[2].hex()}
+                      if kind=='Shipped': row['strategy_bytes']='0x'+vals[3].hex()
+                      lifecycle.append(row)
+                  except Exception as exc:
+                      print('LIFECYCLE_DECODE_FAIL',kind,repr(exc))
+          lifecycle.sort(key=lambda x:(x['block'],x['kind']))
+
+          accounting=[]
+          for topic,kind in [(PULLED,'Pulled'),(PUSHED,'Pushed')]:
+              for log in get_logs(AQUA,[topic],recent_block,latest):
+                  try:
+                      vals=w3.codec.decode(['address','address','bytes32','address','uint256'],HexBytes(log['data']))
+                      if vals[0].lower()!=TARGET: continue
+                      meta=token_meta(vals[3].lower()); ts=timestamp_for(log)
+                      accounting.append({'kind':kind,'tx_hash':log['transactionHash'].hex(),'block':int(log['blockNumber']),'timestamp':ts,'utc':datetime.fromtimestamp(ts,timezone.utc).isoformat(),'maker':vals[0].lower(),'app':vals[1].lower(),'strategy_hash':'0x'+vals[2].hex(),'token':vals[3].lower(),'symbol':meta['symbol'],'amount_raw':str(vals[4]),'amount':human(vals[4],meta['decimals'])})
+                  except Exception as exc:
+                      print('ACCOUNTING_DECODE_FAIL',kind,repr(exc))
+          accounting.sort(key=lambda x:(x['block'],x['tx_hash']))
+
+          # 5) Onchain reward transfers from Merkl Distributor to the target since campaign start.
+          reward_transfers=[]
+          distributor_topic='0x'+'0'*24+DISTRIBUTOR[2:]
+          target_topic='0x'+'0'*24+TARGET[2:]
+          for token_addr,meta in reward_tokens.items():
+              if not token_addr or len(token_addr)!=42: continue
+              for log in get_logs(token_addr,[TRANSFER,distributor_topic,target_topic],campaign_block,latest):
+                  raw=int.from_bytes(HexBytes(log['data']),'big')
+                  ts=timestamp_for(log)
+                  reward_transfers.append({'tx_hash':log['transactionHash'].hex(),'block':int(log['blockNumber']),'timestamp':ts,'utc':datetime.fromtimestamp(ts,timezone.utc).isoformat(),'token':token_addr,'symbol':meta['symbol'],'amount_raw':str(raw),'amount':human(raw,meta['decimals']),'from':DISTRIBUTOR,'to':TARGET})
+          reward_transfers.sort(key=lambda x:(x['block'],x['tx_hash']))
+
+          # 6) Explorer APIs for recent directly visible wallet transactions/token transfers.
+          explorer={}
+          endpoints={
+              'transactions':f'https://eth.blockscout.com/api/v2/addresses/{TARGET}/transactions?filter=to%20%7C%20from',
+              'token_transfers':f'https://eth.blockscout.com/api/v2/addresses/{TARGET}/token-transfers?type=ERC-20',
+          }
+          for name,url in endpoints.items():
+              try:
+                  rr=requests.get(url,timeout=60,headers={'user-agent':'Mozilla/5.0'})
+                  explorer[name]={'status':rr.status_code,'data':rr.json() if rr.ok else rr.text[:2000]}
+              except Exception as exc:
+                  explorer[name]={'error':repr(exc)}
+          dump('result/blockscout_raw.json',explorer)
+
+          # Recent explorer items since RECENT_START_TS only.
+          recent_txs=[]
+          tx_data=(explorer.get('transactions') or {}).get('data')
+          if isinstance(tx_data,dict):
+              for item in tx_data.get('items') or []:
+                  stamp=item.get('timestamp')
+                  try: ts=int(datetime.fromisoformat(stamp.replace('Z','+00:00')).timestamp()) if stamp else 0
+                  except Exception: ts=0
+                  if ts>=RECENT_START_TS:
+                      recent_txs.append(item)
+          recent_token_transfers=[]
+          tr_data=(explorer.get('token_transfers') or {}).get('data')
+          if isinstance(tr_data,dict):
+              for item in tr_data.get('items') or []:
+                  stamp=item.get('timestamp')
+                  try: ts=int(datetime.fromisoformat(stamp.replace('Z','+00:00')).timestamp()) if stamp else 0
+                  except Exception: ts=0
+                  if ts>=RECENT_START_TS:
+                      recent_token_transfers.append(item)
+
+          # Aggregates.
+          fill_groups={}
+          for f in fills:
+              key=(f['strategy_hash'],f['token_in_symbol'],f['token_out_symbol'])
+              g=fill_groups.setdefault('|'.join(key),{'strategy_hash':key[0],'pair':f"{key[1]} -> {key[2]}",'count':0,'amount_in':Decimal(0),'amount_out':Decimal(0),'first_ts':f['timestamp'],'last_ts':f['timestamp']})
+              g['count']+=1; g['amount_in']+=Decimal(f['amount_in']); g['amount_out']+=Decimal(f['amount_out']); g['last_ts']=max(g['last_ts'],f['timestamp']); g['first_ts']=min(g['first_ts'],f['timestamp'])
+          fill_group_rows=[]
+          for g in fill_groups.values():
+              g=dict(g); g['amount_in']=str(g['amount_in']); g['amount_out']=str(g['amount_out']); g['first_utc']=datetime.fromtimestamp(g.pop('first_ts'),timezone.utc).isoformat(); g['last_utc']=datetime.fromtimestamp(g.pop('last_ts'),timezone.utc).isoformat(); fill_group_rows.append(g)
+          fill_group_rows.sort(key=lambda x:x['last_utc'])
+
+          summary={
+              'generated_at':datetime.now(timezone.utc).isoformat(),
+              'target':TARGET,
+              'rpc':rpc_used,
+              'block_range':{'campaign_start_block':campaign_block,'recent_start_block':recent_block,'latest_block':latest},
+              'merkl_rewards':reward_summary,
+              'reward_transfers_from_distributor':reward_transfers,
+              'recent_aqua_fills_count':len(fills),
+              'recent_aqua_fills':fills,
+              'recent_aqua_fill_groups':fill_group_rows,
+              'strategy_lifecycle_since_campaign_start':lifecycle,
+              'recent_aqua_accounting_events':accounting,
+              'recent_direct_transactions':recent_txs,
+              'recent_token_transfers_explorer':recent_token_transfers,
+          }
+          dump('result/summary.json',summary)
+          print('===== SUMMARY JSON =====')
+          print(json.dumps(summary,ensure_ascii=False,indent=2,default=str))
+          PY
+
+      - name: Upload full result
+        uses: actions/upload-artifact@v4
+        with:
+          name: aqua-recent-rewards-20260811
+          path: result
+          if-no-files-found: error
+          retention-days: 1
