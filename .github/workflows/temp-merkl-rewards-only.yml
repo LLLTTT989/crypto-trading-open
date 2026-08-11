@@ -1,0 +1,44 @@
+name: 临时只查 Merkl 奖励
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-merkl-rewards-only.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Merkl rewards and explorer history
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import urllib.request, json
+          from decimal import Decimal, getcontext
+          getcontext().prec=80
+          A='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          urls={
+            'merkl':f'https://api.merkl.xyz/v4/users/{A}/rewards?chainId=1&reloadChainId=1',
+            'transactions':f'https://eth.blockscout.com/api/v2/addresses/{A}/transactions?filter=to%20%7C%20from',
+            'token_transfers':f'https://eth.blockscout.com/api/v2/addresses/{A}/token-transfers?type=ERC-20',
+          }
+          data={}
+          for k,u in urls.items():
+            req=urllib.request.Request(u,headers={'user-agent':'Mozilla/5.0','accept':'application/json'})
+            with urllib.request.urlopen(req,timeout=60) as r:
+              data[k]=json.loads(r.read())
+          rewards=[]
+          for row in data['merkl']:
+            for x in row.get('rewards',[]):
+              t=x.get('token',{}); d=int(t.get('decimals',18)); s=Decimal(10)**d
+              amount=Decimal(str(x.get('amount',0))); claimed=Decimal(str(x.get('claimed',0))); pending=Decimal(str(x.get('pending',0)))
+              rewards.append({'symbol':t.get('symbol'),'address':t.get('address'),'decimals':d,'credited':str(amount/s),'claimed':str(claimed/s),'claimable':str((amount-claimed)/s),'pending':str(pending/s),'total_including_pending':str((amount+pending)/s),'price':t.get('price'),'breakdowns':x.get('breakdowns',[])})
+          print('MERKL_ONLY_BEGIN')
+          print(json.dumps({'rewards':rewards,'recent_transactions':data['transactions'].get('items',[])[:30],'recent_token_transfers':data['token_transfers'].get('items',[])[:60]},ensure_ascii=False,indent=2,default=str))
+          print('MERKL_ONLY_END')
+          PY
